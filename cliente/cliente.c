@@ -6,6 +6,7 @@
 #include <netinet/in.h>   // struct sockaddr_in
 #include <arpa/inet.h>    // htons, inet_pton
 #include <sys/time.h>     // struct timeval
+#include <time.h>         // time() para comparar timestamps
 
 #define USUARIO     "grupo10"
 #define SECRETO     "bPjlHDa8"
@@ -111,6 +112,63 @@ static long buscar_crlf(const char *buf, size_t len) {
         if (buf[i] == '\r' && buf[i + 1] == '\n')
             return (long)i;
     return -1;
+}
+
+/* Valida una PDU (ya sin el \r\n) y devuelve el PARSE_CODE segun la consigna */
+static int validar_pdu(const char *pdu) {
+    /* 1) Tiene que haber un '&' separando TIMESTAMP y MESSAGE */
+    const char *amp = strchr(pdu, '&');
+    if (amp == NULL) return 400;               /* no hay 2 campos */
+
+    size_t ts_len = (size_t)(amp - pdu);       /* largo del timestamp */
+    const char *msg = amp + 1;                 /* el mensaje empieza despues del & */
+    size_t msg_len = strlen(msg);
+
+    /* 2) TIMESTAMP: solo digitos ASCII 0x30-0x39 */
+    if (ts_len == 0) return 405;
+    for (size_t i = 0; i < ts_len; i++)
+        if (pdu[i] < '0' || pdu[i] > '9') return 405;
+
+    /* 3) TIMESTAMP: maximo 11 caracteres */
+    if (ts_len > 11) return 407;
+
+    /* 4) TIMESTAMP: no puede tener mas de 300 s de antiguedad */
+    char ts_str[12];
+    memcpy(ts_str, pdu, ts_len);
+    ts_str[ts_len] = '\0';
+    long long ts = strtoll(ts_str, NULL, 10);
+    if ((long long)time(NULL) - ts > 300) return 406;
+
+    /* 5) MESSAGE: solo 0x20-0x7D, excluyendo '&' (0x26) y '|' (0x7C).
+          unsigned char: asi un byte >= 0x80 (ej. UTF-8 del simbolo ⁰) no queda negativo */
+    for (size_t i = 0; i < msg_len; i++) {
+        unsigned char c = (unsigned char)msg[i];
+        if (c < 0x20 || c > 0x7D || c == 0x26 || c == 0x7C) return 408;
+    }
+
+    /* 6) MESSAGE: entre 1 y 100 caracteres */
+    if (msg_len == 0)  return 409;
+    if (msg_len > 100) return 410;
+
+    return 200;
+}
+
+/* Arma "USUARIO|PDU|CODE|firma" y lo manda por UDP al server.
+   La firma es md5("USUARIO|PDU|CODE|SECRETO"): el secreto no viaja. */
+static void enviar_pdu(int u, const struct sockaddr_in *srv,
+                       const char *pdu, int code) {
+    char a_firmar[1200], firma[33], mensaje[1200];
+
+    snprintf(a_firmar, sizeof a_firmar, "%s|%s|%d|%s", USUARIO, pdu, code, SECRETO);
+    md5_hex(a_firmar, firma);
+
+    snprintf(mensaje, sizeof mensaje, "%s|%s|%d|%s", USUARIO, pdu, code, firma);
+
+    if (sendto(u, mensaje, strlen(mensaje), 0,
+               (const struct sockaddr *)srv, sizeof *srv) < 0)
+        perror("sendto PDU");
+    else
+        printf("  UDP -> [%s]\n", mensaje);
 }
 
 int main(void) {
@@ -249,8 +307,16 @@ int main(void) {
             char pdu[1024];
             memcpy(pdu, acum, (size_t)pos);   /* la PDU sin el \r\n */
             pdu[pos] = '\0';
-            printf("PDU: [%s]\n", pdu);
+            int code = validar_pdu(pdu);
+            printf("PDU: [%s] -> %d\n", pdu, code);
 
+            /* Consigna: solo se envian las PDUs que NO contienen '|' (0x7C),
+               porque el '|' es el delimitador del mensaje UDP (no hay byte stuffing) */
+            if (strchr(pdu, '|') != NULL)
+                printf("  contiene '|', no se envia\n");
+            else
+                enviar_pdu(u, &srv, pdu, code);
+                
             /* Correr lo que sobra al principio del buffer */
             size_t consumido = (size_t)pos + 2;   /* PDU + \r\n */
             memmove(acum, acum + consumido, len - consumido);
