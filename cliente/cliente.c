@@ -85,6 +85,34 @@ static int obtener_ip_publica(char *ip, size_t ip_len) {
     return 0;
 }
 
+
+/* Se conecta por TCP al server en 'puerto'. Devuelve el socket o -1. */
+static int conectar_tcp(int puerto) {
+    int t = socket(AF_INET, SOCK_STREAM, 0);   /* SOCK_STREAM = TCP */
+    if (t < 0) { perror("socket TCP"); return -1; }
+
+    struct sockaddr_in srv;
+    memset(&srv, 0, sizeof srv);
+    srv.sin_family = AF_INET;
+    srv.sin_port   = htons(puerto);
+    inet_pton(AF_INET, SERVER_IP, &srv.sin_addr);
+
+    /* connect() dispara el three-way handshake (SYN, SYN-ACK, ACK) */
+    if (connect(t, (struct sockaddr *)&srv, sizeof srv) < 0) {
+        perror("connect TCP"); close(t); return -1;
+    }
+    return t;
+}
+
+/* Busca "\r\n" en los primeros 'len' bytes de 'buf'.
+   Devuelve la posicion del '\r', o -1 si todavia no hay un CRLF completo. */
+static long buscar_crlf(const char *buf, size_t len) {
+    for (size_t i = 0; i + 1 < len; i++)
+        if (buf[i] == '\r' && buf[i + 1] == '\n')
+            return (long)i;
+    return -1;
+}
+
 int main(void) {
     /* --- Paso 4: IP publica --- */
     char ip[64];
@@ -139,6 +167,7 @@ int main(void) {
 
     /* 5) Esperar la respuesta */
     char buf[1024];
+    int puerto = -1;
     while (1) {
         ssize_t n = recvfrom(u, buf, sizeof(buf) - 1, 0, NULL, NULL);
         if (n < 0) {
@@ -184,13 +213,58 @@ int main(void) {
 
             if (strcmp(esperada, sig) == 0) {
                 printf("Firma OK. Puerto asignado: %s\n", text);
-                break;   /* checkpoint 1 logrado */
+                puerto = atoi(text);
+                break;
             }
         }
 
         /* e) Firma mala o mensaje raro: descartar en silencio y seguir esperando */
     }
-    close(u);
+        if (puerto < 0) { close(u); return 1; }
 
+    int t = conectar_tcp(puerto);
+    if (t < 0) { close(u); return 1; }
+    printf("Conectado por TCP al puerto %d\n", puerto);
+
+    /* Por ahora solo mostramos cada recv crudo, con \r y \n visibles */
+        /* Framing: TCP entrega un flujo de bytes, no mensajes.
+       Acumulamos lo recibido y cortamos una PDU en cada \r\n. */
+    char acum[1024];   /* bytes recibidos que todavia no forman una PDU completa */
+    size_t len = 0;    /* cuantos bytes validos hay en acum */
+    char chunk[512];
+    ssize_t n;
+
+    while ((n = recv(t, chunk, sizeof chunk, 0)) > 0) {
+        /* Si no entra, hay basura sin \r\n (mucho mas que 122 bytes): se descarta */
+        if (len + (size_t)n > sizeof acum) {
+            printf("Buffer lleno sin \\r\\n, descarto %zu bytes\n", len);
+            len = 0;
+        }
+        memcpy(acum + len, chunk, (size_t)n);   /* agregar al final */
+        len += (size_t)n;
+
+        /* Sacar TODAS las PDUs completas que haya (puede haber 0, 1 o varias) */
+        long pos;
+        while ((pos = buscar_crlf(acum, len)) >= 0) {
+            char pdu[1024];
+            memcpy(pdu, acum, (size_t)pos);   /* la PDU sin el \r\n */
+            pdu[pos] = '\0';
+            printf("PDU: [%s]\n", pdu);
+
+            /* Correr lo que sobra al principio del buffer */
+            size_t consumido = (size_t)pos + 2;   /* PDU + \r\n */
+            memmove(acum, acum + consumido, len - consumido);
+            len -= consumido;
+        }
+        /* Lo que queda en acum es una PDU incompleta: espera al proximo recv */
+    }
+    if (n < 0) perror("recv");
+    if (len > 0)
+        printf("Quedaron %zu bytes sin \\r\\n (PDU incompleta, se descarta)\n", len);
+    printf("El servidor cerro la conexion\n");
+
+    close(t);
+    close(u);   /* el UDP lo vamos a reusar en el paso siguiente */
     return 0;
+
 }
