@@ -1,6 +1,12 @@
+# Compilados
 *.o
-build/
-test_md5
-tp_d
+cliente/cliente
+
+# Capturas (se entregan aparte)
 *.pcapng
+
+# Consigna
+*.pdf
+
+# Editor
 .vscode/
