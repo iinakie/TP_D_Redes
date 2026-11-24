@@ -1,12 +1,3 @@
-# Compilados
 *.o
 cliente/cliente
-
-# Capturas (se entregan aparte)
-*.pcapng
-
-# Consigna
-*.pdf
-
-# Editor
 .vscode/
